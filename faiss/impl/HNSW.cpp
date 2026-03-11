@@ -7,8 +7,11 @@
 
 #include <faiss/impl/HNSW.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstddef>
+#include <limits>
 
 #include <faiss/IndexHNSW.h>
 
@@ -593,6 +596,29 @@ using MinimaxHeap = HNSW::MinimaxHeap;
 using Node = HNSW::Node;
 using C = HNSW::C;
 
+static inline int get_amx_level0_efs_cap() {
+    static const int cap = []() {
+        const char* env = std::getenv("FAISS_AMX_LEVEL0_EFS_CAP");
+        if (!env || !*env) {
+            return 0;
+        }
+
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        if (end == env || parsed <= 0 ||
+            parsed > std::numeric_limits<int>::max()) {
+            return 0;
+        }
+        return static_cast<int>(parsed);
+    }();
+
+    return cap;
+}
+
+static inline bool node_distance_closer(const Node& lhs, const Node& rhs) {
+    return lhs.first < rhs.first;
+}
+
 /** Helper to extract search parameters from HNSW and SearchParameters */
 static inline void extract_search_params(
         const HNSW& hnsw,
@@ -747,6 +773,202 @@ int search_from_candidates(
         stats.ndis += ndis;
         stats.nhops += nstep;
     }
+
+    return nres;
+}
+
+int search_from_candidates_level0_batched(
+        const HNSW& hnsw,
+        DistanceComputer& qdis,
+        ResultHandler& res,
+        MinimaxHeap& candidates,
+        VisitedTable& vt,
+        HNSWStats& stats,
+        int nres_in,
+        int frontier_window,
+        int batch_threshold,
+        int refill_topk,
+        const SearchParameters* params) {
+    int nres = nres_in;
+    int ndis = 0;
+
+    bool do_dis_check;
+    int efSearch;
+    const IDSelector* sel;
+    extract_search_params(hnsw, params, do_dis_check, efSearch, sel);
+
+    C::T threshold = res.threshold;
+    for (int i = 0; i < candidates.size(); i++) {
+        idx_t v1 = candidates.ids[i];
+        float d = candidates.dis[i];
+        FAISS_ASSERT(v1 >= 0);
+        if (!sel || sel->is_member(v1)) {
+            if (d < threshold) {
+                if (res.add_result(d, v1)) {
+                    threshold = res.threshold;
+                }
+            }
+        }
+        vt.set(v1);
+    }
+
+    thread_local std::vector<idx_t> frontier_ids;
+    thread_local std::vector<float> frontier_dis;
+    thread_local std::vector<idx_t> batch_ids;
+    thread_local std::vector<float> batch_dis;
+    thread_local std::vector<Node> active_nodes;
+    thread_local std::vector<Node> next_nodes;
+    thread_local std::vector<size_t> order;
+
+    frontier_ids.clear();
+    frontier_dis.clear();
+    batch_ids.clear();
+    batch_dis.clear();
+    active_nodes.clear();
+    next_nodes.clear();
+    order.clear();
+
+    const int env_efs_cap = get_amx_level0_efs_cap();
+    const int effective_capped_efs =
+            env_efs_cap > 0 ? std::min(efSearch, env_efs_cap) : efSearch;
+    const int effective_frontier_window = frontier_window > 1
+            ? std::min(std::max(1, frontier_window), effective_capped_efs)
+            : std::max(1, effective_capped_efs);
+    const int effective_batch_threshold = std::max(1, batch_threshold);
+    const int effective_refill_topk = std::max(0, refill_topk);
+
+    int nstep = 0;
+    while (candidates.size() > 0) {
+        active_nodes.clear();
+        active_nodes.reserve(candidates.size());
+        for (int i = 0; i < candidates.k; ++i) {
+            idx_t id = candidates.ids[i];
+            if (id >= 0) {
+                active_nodes.emplace_back(candidates.dis[i], id);
+            }
+        }
+        if (active_nodes.empty()) {
+            break;
+        }
+
+        const size_t beam_size = std::min<size_t>(
+                effective_frontier_window, active_nodes.size());
+        if (beam_size < active_nodes.size()) {
+            std::nth_element(
+                    active_nodes.begin(),
+                    active_nodes.begin() + beam_size,
+                    active_nodes.end(),
+                    node_distance_closer);
+            active_nodes.resize(beam_size);
+        }
+        std::sort(active_nodes.begin(), active_nodes.end(), node_distance_closer);
+
+        const float d0 = active_nodes.front().first;
+        if (do_dis_check &&
+            threshold < std::numeric_limits<C::T>::infinity() &&
+            d0 >= threshold) {
+            break;
+        }
+
+        candidates.clear();
+        frontier_ids.clear();
+        frontier_dis.clear();
+        frontier_ids.reserve(active_nodes.size());
+        frontier_dis.reserve(active_nodes.size());
+        for (const Node& node : active_nodes) {
+            frontier_ids.push_back(node.second);
+            frontier_dis.push_back(node.first);
+        }
+
+        batch_ids.clear();
+        for (idx_t frontier_id : frontier_ids) {
+            size_t begin, end;
+            hnsw.neighbor_range(frontier_id, 0, &begin, &end);
+            for (size_t j = begin; j < end; ++j) {
+                int v1 = hnsw.neighbors[j];
+                if (v1 < 0) {
+                    break;
+                }
+
+                vt.prefetch(v1);
+                if (vt.set(v1)) {
+                    batch_ids.push_back(v1);
+                }
+            }
+        }
+
+        threshold = res.threshold;
+        next_nodes.clear();
+        next_nodes.reserve(frontier_ids.size() + batch_ids.size());
+        for (size_t i = 0; i < frontier_ids.size(); ++i) {
+            next_nodes.emplace_back(frontier_dis[i], frontier_ids[i]);
+        }
+
+        if (!batch_ids.empty()) {
+            batch_dis.resize(batch_ids.size());
+            if ((int)batch_ids.size() >= effective_batch_threshold) {
+                qdis.distances_batch(
+                        batch_ids.size(), batch_ids.data(), batch_dis.data());
+                ndis += batch_ids.size();
+            } else {
+                for (size_t i = 0; i < batch_ids.size(); ++i) {
+                    batch_dis[i] = qdis(batch_ids[i]);
+                }
+                ndis += batch_ids.size();
+            }
+
+            for (size_t i = 0; i < batch_ids.size(); ++i) {
+                const idx_t idx = batch_ids[i];
+                const float dis = batch_dis[i];
+                if (!sel || sel->is_member(idx)) {
+                    if (dis < threshold) {
+                        if (res.add_result(dis, idx)) {
+                            threshold = res.threshold;
+                            nres += 1;
+                        }
+                    }
+                }
+                next_nodes.emplace_back(dis, idx);
+            }
+        }
+
+        const int refill_width = effective_refill_topk > 0
+                ? std::min(effective_refill_topk, effective_frontier_window)
+                : effective_frontier_window;
+        const size_t next_width = std::min<size_t>(
+                std::max(1, refill_width), next_nodes.size());
+        if (next_width < next_nodes.size()) {
+            order.resize(next_nodes.size());
+            std::iota(order.begin(), order.end(), size_t(0));
+            std::nth_element(
+                    order.begin(),
+                    order.begin() + next_width,
+                    order.end(),
+                    [&](size_t lhs, size_t rhs) {
+                        return next_nodes[lhs].first < next_nodes[rhs].first;
+                    });
+            for (size_t i = 0; i < next_width; ++i) {
+                const Node& node = next_nodes[order[i]];
+                candidates.push(node.second, node.first);
+            }
+        } else {
+            for (const Node& node : next_nodes) {
+                candidates.push(node.second, node.first);
+            }
+        }
+
+        nstep += frontier_ids.size();
+        if (batch_ids.empty() || nstep >= efSearch) {
+            break;
+        }
+    }
+
+    stats.n1++;
+    if (candidates.size() == 0) {
+        stats.n2++;
+    }
+    stats.ndis += ndis;
+    stats.nhops += nstep;
 
     return nres;
 }
@@ -1202,11 +1424,19 @@ HNSWStats HNSW::search(
 
     bool bounded_queue = this->search_bounded_queue;
     int efSearch = this->efSearch;
+    int level0_search_mode = this->level0_search_mode;
+    int level0_frontier_window = this->level0_frontier_window;
+    int level0_batch_threshold = this->level0_batch_threshold;
+    int level0_refill_topk = this->level0_refill_topk;
     if (params) {
         if (const SearchParametersHNSW* hnsw_params =
                     dynamic_cast<const SearchParametersHNSW*>(params)) {
             bounded_queue = hnsw_params->bounded_queue;
             efSearch = hnsw_params->efSearch;
+            level0_search_mode = hnsw_params->level0_search_mode;
+            level0_frontier_window = hnsw_params->level0_frontier_window;
+            level0_batch_threshold = hnsw_params->level0_batch_threshold;
+            level0_refill_topk = hnsw_params->level0_refill_topk;
         }
     }
 
@@ -1228,8 +1458,23 @@ HNSWStats HNSW::search(
         candidates.push(nearest, d_nearest);
 
         if (!is_panorama) {
-            search_from_candidates(
-                    *this, qdis, res, candidates, vt, stats, 0, 0, params);
+            if (level0_search_mode == 1) {
+                search_from_candidates_level0_batched(
+                        *this,
+                        qdis,
+                        res,
+                        candidates,
+                        vt,
+                        stats,
+                        0,
+                        level0_frontier_window,
+                        level0_batch_threshold,
+                        level0_refill_topk,
+                        params);
+            } else {
+                search_from_candidates(
+                        *this, qdis, res, candidates, vt, stats, 0, 0, params);
+            }
         } else {
             search_from_candidates_panorama(
                     *this,
@@ -1279,10 +1524,16 @@ void HNSW::search_level_0(
     const HNSW& hnsw = *this;
 
     auto efSearch = hnsw.efSearch;
+    int level0_frontier_window = hnsw.level0_frontier_window;
+    int level0_batch_threshold = hnsw.level0_batch_threshold;
+    int level0_refill_topk = hnsw.level0_refill_topk;
     if (params) {
         if (const SearchParametersHNSW* hnsw_params =
                     dynamic_cast<const SearchParametersHNSW*>(params)) {
             efSearch = hnsw_params->efSearch;
+            level0_frontier_window = hnsw_params->level0_frontier_window;
+            level0_batch_threshold = hnsw_params->level0_batch_threshold;
+            level0_refill_topk = hnsw_params->level0_refill_topk;
         }
     }
 
@@ -1335,6 +1586,32 @@ void HNSW::search_level_0(
 
         search_from_candidates(
                 hnsw, qdis, res, candidates, vt, search_stats, 0, 0, params);
+    } else if (search_type == 3) {
+        int candidates_size = std::max(efSearch, int(k));
+        candidates_size = std::max(candidates_size, int(nprobe));
+
+        MinimaxHeap candidates(candidates_size);
+        for (int j = 0; j < nprobe; j++) {
+            storage_idx_t cj = nearest_i[j];
+
+            if (cj < 0) {
+                break;
+            }
+            candidates.push(cj, nearest_d[j]);
+        }
+
+        search_from_candidates_level0_batched(
+                hnsw,
+                qdis,
+                res,
+                candidates,
+                vt,
+                search_stats,
+                0,
+                level0_frontier_window,
+                level0_batch_threshold,
+                level0_refill_topk,
+                params);
     }
 }
 

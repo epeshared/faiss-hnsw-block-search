@@ -15,3 +15,7 @@ add_executable(bench_result_handler_overhead EXCLUDE_FROM_ALL
   bench_result_handler_overhead.cpp)
 target_link_libraries(bench_result_handler_overhead PRIVATE faiss_avx512 ${BLAS_LIBRARIES} ${LAPACK_LIBRARIES} OpenMP::OpenMP_CXX)
 target_compile_options(bench_result_handler_overhead PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx2 -mfma -mf16c -mavx512f -mavx512cd -mavx512vl -mavx512dq -mavx512bw -mpopcnt>)
+
+add_executable(bench_hnsw_sq_amx_level0 EXCLUDE_FROM_ALL bench_hnsw_sq_amx_level0.cpp)
+target_link_libraries(bench_hnsw_sq_amx_level0 PRIVATE faiss_avx512_spr ${BLAS_LIBRARIES} ${LAPACK_LIBRARIES} OpenMP::OpenMP_CXX)
+target_compile_options(bench_hnsw_sq_amx_level0 PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-march=sapphirerapids -mtune=sapphirerapids -mamx-tile -mamx-bf16>)

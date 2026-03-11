@@ -110,6 +110,7 @@ set(FAISS_SRC
   impl/LocalSearchQuantizer.cpp
   impl/ProductAdditiveQuantizer.cpp
   impl/ScalarQuantizer.cpp
+  impl/scalar_quantizer/sq-amx.cpp
   impl/scalar_quantizer/training.cpp
   impl/index_read.cpp
   impl/index_write.cpp
@@ -247,6 +248,7 @@ set(FAISS_HEADERS
   impl/ScalarQuantizer.h
   impl/expanded_scanners.h
   impl/scalar_quantizer/codecs.h
+  impl/scalar_quantizer/amx_bf16_ip.h
   impl/scalar_quantizer/distance_computers.h
   impl/scalar_quantizer/quantizers.h
   impl/scalar_quantizer/scanners.h
@@ -389,14 +391,14 @@ endif()
 if(NOT WIN32)
   # Architecture mode to support AVX512 extensions available since Intel(R) Sapphire Rapids.
   # Ref: https://networkbuilders.intel.com/solutionslibrary/intel-avx-512-fp16-instruction-set-for-intel-xeon-processor-based-products-technology-guide
-  target_compile_options(faiss_avx512_spr PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-march=sapphirerapids -mtune=sapphirerapids>)
+  target_compile_options(faiss_avx512_spr PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-march=sapphirerapids -mtune=sapphirerapids -mamx-tile -mamx-bf16>)
 else()
   target_compile_options(faiss_avx512_spr PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX512>)
   # we need bigobj for the swig wrapper
   add_compile_options(/bigobj)
 endif()
 target_sources(faiss_avx512_spr PRIVATE ${FAISS_SIMD_AVX2_SRC} ${FAISS_SIMD_AVX512_SRC})
-target_compile_definitions(faiss_avx512_spr PRIVATE COMPILE_SIMD_AVX2 COMPILE_SIMD_AVX512)
+target_compile_definitions(faiss_avx512_spr PRIVATE COMPILE_SIMD_AVX2 COMPILE_SIMD_AVX512 FAISS_OPT_AMX)
 
 add_library(faiss_sve ${FAISS_SRC})
 if(NOT FAISS_OPT_LEVEL STREQUAL "sve")

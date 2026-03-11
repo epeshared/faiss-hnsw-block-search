@@ -23,6 +23,8 @@
 
 namespace faiss {
 
+#define FAISS_ENABLE_LEVEL0_BATCHED_EXPANSION 1
+
 // Forward declarations to avoid circular dependency.
 struct IndexHNSW;
 struct IndexHNSWFlatPanorama;
@@ -51,6 +53,10 @@ struct SearchParametersHNSW : SearchParameters {
     int efSearch = 16;
     bool check_relative_distance = true;
     bool bounded_queue = true;
+        int level0_search_mode = 0;
+        int level0_frontier_window = 1;
+        int level0_batch_threshold = 32;
+        int level0_refill_topk = 0;
 
     ~SearchParametersHNSW() {}
 };
@@ -148,6 +154,18 @@ struct HNSW {
 
     /// use bounded queue during exploration
     bool search_bounded_queue = true;
+
+        /// level-0 search mode: 0 = default greedy expansion, 1 = batched expansion
+        int level0_search_mode = 0;
+
+        /// pop this many frontier nodes before evaluating a merged level-0 batch
+        int level0_frontier_window = 1;
+
+        /// minimum merged candidate count before using batch distance evaluation
+        int level0_batch_threshold = 32;
+
+        /// if > 0, keep only this many best candidates from each merged batch
+        int level0_refill_topk = 0;
 
     /// use Panorama progressive pruning in search
     bool is_panorama = false;
