@@ -155,6 +155,13 @@ SQDistanceComputer* select_distance_computer_body(
             return new DCTemplate<QuantizerFP16<SL2>, Sim, SL2>(d, trained);
 
         case ScalarQuantizer::QT_bf16:
+#if defined(FAISS_OPT_AMX) && defined(__AMX_TILE__) && defined(__AMX_BF16__)
+            if constexpr (
+                    SL2 == SIMDLevel::AVX512 &&
+                    std::is_same_v<Sim, SimilarityIP<SIMDLevel::AVX512>>) {
+                return new DCBF16IPAmx<SL2>(d, trained);
+            }
+#endif
             return new DCTemplate<QuantizerBF16<SL2>, Sim, SL2>(d, trained);
 
         case ScalarQuantizer::QT_8bit_direct:

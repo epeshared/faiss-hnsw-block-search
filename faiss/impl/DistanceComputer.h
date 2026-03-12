@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include <faiss/Index.h>
 
 namespace faiss {
@@ -53,6 +55,14 @@ struct DistanceComputer {
         dis3 = d3;
     }
 
+    /// compute distances of current query to a batch of stored vectors.
+    /// Default implementation falls back to per-vector computation.
+    virtual void distances_batch(size_t n, const idx_t* idx, float* dis) {
+        for (size_t i = 0; i < n; ++i) {
+            dis[i] = this->operator()(idx[i]);
+        }
+    }
+
     /// compute distance between two stored vectors
     virtual float symmetric_dis(idx_t i, idx_t j) = 0;
 
@@ -93,6 +103,13 @@ struct NegativeDistanceComputer : DistanceComputer {
         dis1 = -dis1;
         dis2 = -dis2;
         dis3 = -dis3;
+    }
+
+    void distances_batch(size_t n, const idx_t* idx, float* dis) override {
+        basedis->distances_batch(n, idx, dis);
+        for (size_t i = 0; i < n; ++i) {
+            dis[i] = -dis[i];
+        }
     }
 
     /// compute distance between two stored vectors
