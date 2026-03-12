@@ -615,6 +615,25 @@ static inline int get_amx_level0_efs_cap() {
     return cap;
 }
 
+static inline int get_amx_level0_per_frontier_keep() {
+    static const int keep = []() {
+        const char* env = std::getenv("FAISS_AMX_LEVEL0_PER_FRONTIER_KEEP");
+        if (!env || !*env) {
+            return 0;
+        }
+
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        if (end == env || parsed <= 0 ||
+            parsed > std::numeric_limits<int>::max()) {
+            return 0;
+        }
+        return static_cast<int>(parsed);
+    }();
+
+    return keep;
+}
+
 static inline bool node_distance_closer(const Node& lhs, const Node& rhs) {
     return lhs.first < rhs.first;
 }
@@ -815,20 +834,27 @@ int search_from_candidates_level0_batched(
     thread_local std::vector<idx_t> frontier_ids;
     thread_local std::vector<float> frontier_dis;
     thread_local std::vector<idx_t> batch_ids;
+    thread_local std::vector<int> batch_owner;
+    thread_local std::vector<int> pooled_owner;
     thread_local std::vector<float> batch_dis;
     thread_local std::vector<Node> active_nodes;
     thread_local std::vector<Node> next_nodes;
     thread_local std::vector<size_t> order;
+    thread_local std::vector<char> selected;
 
     frontier_ids.clear();
     frontier_dis.clear();
     batch_ids.clear();
+    batch_owner.clear();
+    pooled_owner.clear();
     batch_dis.clear();
     active_nodes.clear();
     next_nodes.clear();
     order.clear();
+    selected.clear();
 
     const int env_efs_cap = get_amx_level0_efs_cap();
+    const int env_per_frontier_keep = get_amx_level0_per_frontier_keep();
     const int effective_capped_efs =
             env_efs_cap > 0 ? std::min(efSearch, env_efs_cap) : efSearch;
     const int effective_frontier_window = frontier_window > 1
@@ -881,7 +907,9 @@ int search_from_candidates_level0_batched(
         }
 
         batch_ids.clear();
-        for (idx_t frontier_id : frontier_ids) {
+        batch_owner.clear();
+        for (size_t frontier_pos = 0; frontier_pos < frontier_ids.size(); ++frontier_pos) {
+            idx_t frontier_id = frontier_ids[frontier_pos];
             size_t begin, end;
             hnsw.neighbor_range(frontier_id, 0, &begin, &end);
             for (size_t j = begin; j < end; ++j) {
@@ -893,13 +921,16 @@ int search_from_candidates_level0_batched(
                 vt.prefetch(v1);
                 if (vt.set(v1)) {
                     batch_ids.push_back(v1);
+                    batch_owner.push_back((int)frontier_pos);
                 }
             }
         }
 
         threshold = res.threshold;
         next_nodes.clear();
+        pooled_owner.clear();
         next_nodes.reserve(frontier_ids.size() + batch_ids.size());
+        pooled_owner.reserve(batch_ids.size());
         for (size_t i = 0; i < frontier_ids.size(); ++i) {
             next_nodes.emplace_back(frontier_dis[i], frontier_ids[i]);
         }
@@ -929,15 +960,57 @@ int search_from_candidates_level0_batched(
                     }
                 }
                 next_nodes.emplace_back(dis, idx);
+                pooled_owner.push_back(batch_owner[i]);
             }
         }
 
         const int refill_width = effective_refill_topk > 0
                 ? std::min(effective_refill_topk, effective_frontier_window)
                 : effective_frontier_window;
+
         const size_t next_width = std::min<size_t>(
                 std::max(1, refill_width), next_nodes.size());
-        if (next_width < next_nodes.size()) {
+        size_t filled = 0;
+        selected.assign(next_nodes.size(), 0);
+
+        if (env_per_frontier_keep > 0 && !batch_ids.empty()) {
+            const size_t per_frontier_keep = (size_t)std::max(0, env_per_frontier_keep);
+            for (size_t frontier_pos = 0;
+                 frontier_pos < frontier_ids.size() && filled < next_width;
+                 ++frontier_pos) {
+                order.clear();
+                for (size_t i = 0; i < pooled_owner.size(); ++i) {
+                    if ((size_t)pooled_owner[i] == frontier_pos) {
+                        order.push_back(frontier_ids.size() + i);
+                    }
+                }
+                if (order.empty()) {
+                    continue;
+                }
+                const size_t local_keep = std::min(
+                        std::min(per_frontier_keep, order.size()),
+                        next_width - filled);
+                if (local_keep < order.size()) {
+                    std::nth_element(
+                            order.begin(),
+                            order.begin() + local_keep,
+                            order.end(),
+                            [&](size_t lhs, size_t rhs) {
+                                return next_nodes[lhs].first < next_nodes[rhs].first;
+                            });
+                }
+                for (size_t i = 0; i < local_keep; ++i) {
+                    const size_t pos = order[i];
+                    if (!selected[pos]) {
+                        candidates.push(next_nodes[pos].second, next_nodes[pos].first);
+                        selected[pos] = 1;
+                        ++filled;
+                    }
+                }
+            }
+        }
+
+        if (filled < next_width && next_width < next_nodes.size()) {
             order.resize(next_nodes.size());
             std::iota(order.begin(), order.end(), size_t(0));
             std::nth_element(
@@ -947,13 +1020,25 @@ int search_from_candidates_level0_batched(
                     [&](size_t lhs, size_t rhs) {
                         return next_nodes[lhs].first < next_nodes[rhs].first;
                     });
-            for (size_t i = 0; i < next_width; ++i) {
-                const Node& node = next_nodes[order[i]];
+            for (size_t i = 0; i < order.size() && filled < next_width; ++i) {
+                const size_t pos = order[i];
+                if (selected[pos]) {
+                    continue;
+                }
+                const Node& node = next_nodes[pos];
                 candidates.push(node.second, node.first);
+                selected[pos] = 1;
+                ++filled;
             }
-        } else {
-            for (const Node& node : next_nodes) {
+        } else if (filled < next_width) {
+            for (size_t i = 0; i < next_nodes.size() && filled < next_width; ++i) {
+                if (selected[i]) {
+                    continue;
+                }
+                const Node& node = next_nodes[i];
                 candidates.push(node.second, node.first);
+                selected[i] = 1;
+                ++filled;
             }
         }
 
